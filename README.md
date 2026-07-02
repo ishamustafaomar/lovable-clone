@@ -1,1 +1,128 @@
-# lovable-clone
+# 🔨 Forge — a Replit-style mobile app builder
+
+Forge is a SwiftUI iPhone app that builds **live web apps from natural-language prompts**, in the spirit of the Replit mobile app: describe what you want, watch Claude write the code, and use the running app right inside the phone — with chat-driven iteration, a code browser, and a live preview.
+
+```
+┌────────────────┐     HTTPS (JSON)      ┌─────────────────────────┐
+│  Forge (iOS)   │ ───────────────────▶  │  Convex backend          │
+│  SwiftUI app   │  ◀─────────────────── │  (DB + HTTP API +        │
+│                │    polling            │   background actions)    │
+│  • Chat        │                       │      │            │      │
+│  • Preview     │                       │      ▼            ▼      │
+│  • Code        │                       │  Claude API    Daytona    │
+└────────────────┘                       │  (codegen)     (sandbox) │
+        │                                └─────────────────────────┘
+        │            live preview URL (https://3000-<sandbox>.proxy.daytona.work)
+        └───────────────────────────────────────────▶  WKWebView
+```
+
+**Stack**
+
+| Piece | Tech |
+|---|---|
+| iOS app | SwiftUI (iOS 17+), WKWebView preview, dark Replit-style UI |
+| Database + API | [Convex](https://convex.dev) — tables for projects/messages/files, HTTP actions as the mobile API, scheduler for background builds |
+| Code generation | Claude (`claude-opus-4-8`) via `@anthropic-ai/sdk`, structured JSON output (multi-file static web apps) |
+| App hosting | [Daytona](https://daytona.io) sandboxes — each project gets an isolated cloud sandbox serving the generated app on a public preview URL |
+
+**How a build works**
+
+1. You tap **Enter App** (single local user — no auth) and describe an app.
+2. `POST /api/projects` inserts the project and schedules `builder.build` via the Convex scheduler.
+3. The build action asks Claude for a complete multi-file static web app (structured output, streaming).
+4. Files are saved to Convex, then uploaded into a Daytona sandbox (`public: true`), served by `python3 -m http.server 3000`.
+5. The sandbox's public preview URL is stored on the project; the app polls, flips to **Live**, and renders it in the Preview tab.
+6. Every follow-up chat message re-generates the complete file set and hot-swaps the sandbox contents.
+
+Sandboxes auto-stop after 30 minutes of inactivity (to save quota); the app's **Wake Sandbox** button restarts them via `POST /api/projects/:id/wake`.
+
+---
+
+## 1. Deploy the backend (5 minutes)
+
+Requirements: Node 18+, a free [Convex](https://dashboard.convex.dev) account, an [Anthropic API key](https://console.anthropic.com), and a [Daytona API key](https://app.daytona.io) (free tier includes $200 credits).
+
+```bash
+cd backend
+npm install
+
+# Create/attach a Convex dev deployment (opens browser on first run)
+npx convex dev --once
+
+# Set the API keys on the deployment
+npx convex env set ANTHROPIC_API_KEY 'sk-ant-...'
+npx convex env set DAYTONA_API_KEY 'dtn_...'
+
+# Keep functions synced while developing (or `npx convex deploy` for prod)
+npx convex dev
+```
+
+Your mobile API base URL is the deployment's **HTTP Actions URL** — it ends in **`.convex.site`** (not `.convex.cloud`). Find it in the Convex dashboard under *Settings → URL & Deploy Key*, e.g. `https://happy-animal-123.convex.site`.
+
+Sanity check:
+
+```bash
+curl https://<your-deployment>.convex.site/api/health
+# → {"ok":true}
+```
+
+## 2. Run the iOS app in the Simulator
+
+Requirements: macOS with **Xcode 16+** (the project uses the Xcode 16 folder-synchronized project format).
+
+**Xcode UI:** open `ios/Forge.xcodeproj`, pick an iPhone simulator, hit **Run** (⌘R). No signing setup needed for the simulator.
+
+**Command line:**
+
+```bash
+cd ios
+xcodebuild -project Forge.xcodeproj -scheme Forge \
+  -destination 'platform=iOS Simulator,name=iPhone 16,OS=latest' \
+  -derivedDataPath build build
+
+open -a Simulator
+xcrun simctl boot 'iPhone 16' 2>/dev/null || true
+xcrun simctl install booted build/Build/Products/Debug-iphonesimulator/Forge.app
+xcrun simctl launch booted dev.forge.app
+```
+
+First launch: tap **Enter App** → the gear icon (Settings) → paste your `https://….convex.site` URL → **Save & Test** → create your first app.
+
+*(Prefer XcodeGen? `ios/project.yml` is included — `brew install xcodegen && cd ios && xcodegen generate`.)*
+
+## 3. HTTP API (what the app talks to)
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/api/health` | Liveness check |
+| `GET` | `/api/projects` | List projects |
+| `POST` | `/api/projects` | `{name?, prompt}` → creates project, schedules build, returns `{projectId}` |
+| `GET` | `/api/projects/:id` | Project + chat messages |
+| `GET` | `/api/projects/:id/files` | Generated source files |
+| `POST` | `/api/projects/:id/messages` | `{prompt}` → iterate on the app (409 while a build is running) |
+| `POST` | `/api/projects/:id/wake` | Restart a slept sandbox |
+| `DELETE` | `/api/projects/:id` | Delete project + its sandbox |
+
+> ⚠️ Like the "one user, no auth" brief, these endpoints are unauthenticated. Anyone with your deployment URL can create builds — don't ship this to production without adding an auth layer.
+
+## Repo layout
+
+```
+backend/               Convex backend
+  convex/schema.ts       projects / messages / files tables
+  convex/http.ts         HTTP API for the iOS app
+  convex/builder.ts      "use node" action: Claude codegen + Daytona deploy
+  convex/projects|messages|files.ts   internal queries/mutations
+ios/
+  Forge.xcodeproj/       Xcode 16 project (hand-authored, synchronized folder)
+  Forge/                 SwiftUI sources
+  Config/Info.plist      ATS exceptions for the WebView
+  project.yml            optional XcodeGen spec
+```
+
+## Troubleshooting
+
+- **"Backend not configured" / red banner** — Settings → paste the `.convex.site` URL (not `.convex.cloud`), Save & Test.
+- **Build fails with "ANTHROPIC_API_KEY is not set"** — run the `npx convex env set …` commands against the same deployment the app points at (add `--prod` if you deployed with `npx convex deploy`).
+- **Preview never loads** — the sandbox may have auto-stopped; open the Preview tab and tap **Wake Sandbox**. Check the Daytona dashboard for quota (free tier: 10 vCPU running at once).
+- **Xcode says "future project format"** — you're on Xcode 15 or older; upgrade to Xcode 16+, or regenerate the project with XcodeGen (`ios/project.yml`).

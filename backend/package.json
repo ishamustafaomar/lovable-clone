@@ -1,0 +1,21 @@
+{
+  "name": "forge-backend",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Convex backend for Forge \u2014 generates web apps with Claude and runs them in Daytona sandboxes",
+  "scripts": {
+    "dev": "convex dev",
+    "deploy": "convex deploy",
+    "codegen": "convex codegen",
+    "typecheck": "tsc --noEmit -p convex"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.109.1",
+    "@daytona/sdk": "^0.192.0",
+    "convex": "^1.42.1"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3"
+  }
+}
