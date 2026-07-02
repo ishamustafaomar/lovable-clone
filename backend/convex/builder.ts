@@ -289,6 +289,8 @@ function sanitizeFiles(files: GeneratedFile[]): GeneratedFile[] {
     if (!file?.path || typeof file.content !== "string") continue;
     const path = file.path.replace(/^\/+/, "").trim();
     if (!path || path.includes("..") || path.length > 200) continue;
+    // Paths end up in shell commands — allow only a conservative charset.
+    if (!/^[A-Za-z0-9._/-]+$/.test(path)) continue;
     if (seen.has(path)) continue;
     seen.add(path);
     clean.push({ path, content: file.content });
