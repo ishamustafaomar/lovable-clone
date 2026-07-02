@@ -13,6 +13,8 @@ export const add = internalMutation({
     content: v.string(),
   },
   handler: async (ctx, args) => {
+    // Tolerate the project having been deleted mid-build.
+    if (!(await ctx.db.get(args.projectId))) return;
     await ctx.db.insert("messages", {
       projectId: args.projectId,
       role: args.role,

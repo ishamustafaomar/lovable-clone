@@ -25,6 +25,7 @@ final class APIClient {
     static let shared = APIClient()
 
     static let backendURLKey = "backendURL"
+    static let apiSecretKey = "apiSecret"
 
     private let session: URLSession
 
@@ -103,6 +104,9 @@ final class APIClient {
         var urlRequest = URLRequest(url: url)
         urlRequest.httpMethod = method
         urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        if let secret = UserDefaults.standard.string(forKey: Self.apiSecretKey), !secret.isEmpty {
+            urlRequest.setValue(secret, forHTTPHeaderField: "x-forge-secret")
+        }
         urlRequest.httpBody = bodyData
 
         let (data, response) = try await session.data(for: urlRequest)

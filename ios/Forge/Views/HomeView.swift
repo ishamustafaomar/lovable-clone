@@ -61,14 +61,24 @@ struct HomeView: View {
             ZStack {
                 Theme.background.ignoresSafeArea()
 
-                Group {
-                    if !APIClient.shared.isConfigured {
-                        configureBackendState
-                    } else if viewModel.projects.isEmpty && !viewModel.isLoading {
-                        emptyState
-                    } else {
-                        projectList
+                VStack(spacing: 0) {
+                    // Surface connection errors in every state — otherwise an
+                    // unreachable backend masquerades as "No apps yet".
+                    if let error = viewModel.errorMessage {
+                        errorBanner(error)
+                            .padding(.horizontal, 16)
+                            .padding(.top, 8)
                     }
+                    Group {
+                        if !APIClient.shared.isConfigured {
+                            configureBackendState
+                        } else if viewModel.projects.isEmpty && !viewModel.isLoading {
+                            emptyState
+                        } else {
+                            projectList
+                        }
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
 
                 VStack {
@@ -127,9 +137,6 @@ struct HomeView: View {
     private var projectList: some View {
         ScrollView {
             LazyVStack(spacing: 12) {
-                if let error = viewModel.errorMessage {
-                    errorBanner(error)
-                }
                 ForEach(viewModel.projects) { project in
                     NavigationLink(value: project.id) {
                         ProjectRow(project: project)

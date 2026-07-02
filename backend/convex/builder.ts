@@ -72,6 +72,11 @@ export const build = internalAction({
         isFirstBuild: args.isFirstBuild,
       });
 
+      // Generation takes minutes — the project may have been deleted meanwhile.
+      if (!(await ctx.runQuery(internal.projects.get, { projectId: args.projectId }))) {
+        return;
+      }
+
       await ctx.runMutation(internal.files.replaceAll, {
         projectId: args.projectId,
         files: app.files,
@@ -88,6 +93,14 @@ export const build = internalAction({
 
       const deployed = await deployToSandbox(project.sandboxId, app.files);
 
+      // If the project was deleted while we deployed, don't leak the sandbox.
+      if (!(await ctx.runQuery(internal.projects.get, { projectId: args.projectId }))) {
+        await ctx.scheduler.runAfter(0, internal.builder.destroySandbox, {
+          sandboxId: deployed.sandboxId,
+        });
+        return;
+      }
+
       await ctx.runMutation(internal.projects.update, {
         projectId: args.projectId,
         status: "ready",
@@ -102,12 +115,16 @@ export const build = internalAction({
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      await setStatus("error", message);
-      await ctx.runMutation(internal.messages.add, {
-        projectId: args.projectId,
-        role: "error",
-        content: `Build failed: ${message}`,
-      });
+      try {
+        await setStatus("error", message);
+        await ctx.runMutation(internal.messages.add, {
+          projectId: args.projectId,
+          role: "error",
+          content: `Build failed: ${message}`,
+        });
+      } catch {
+        // Project vanished while reporting the failure — nothing left to do.
+      }
     }
   },
 });
@@ -120,6 +137,8 @@ export const wake = internalAction({
       projectId: args.projectId,
     });
     if (!project?.sandboxId) return;
+    // Never fight an in-flight build over the status field.
+    if (project.status === "generating" || project.status === "deploying") return;
 
     try {
       const daytona = new Daytona();
@@ -130,6 +149,13 @@ export const wake = internalAction({
       }
       await ensureServerRunning(sandbox);
       const preview = await sandbox.getPreviewLink(PORT);
+      // A build may have started while the sandbox was booting — don't clobber it.
+      const current = await ctx.runQuery(internal.projects.get, {
+        projectId: args.projectId,
+      });
+      if (!current || current.status === "generating" || current.status === "deploying") {
+        return;
+      }
       await ctx.runMutation(internal.projects.update, {
         projectId: args.projectId,
         status: "ready",
@@ -138,6 +164,12 @@ export const wake = internalAction({
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
+      const current = await ctx.runQuery(internal.projects.get, {
+        projectId: args.projectId,
+      });
+      if (!current || current.status === "generating" || current.status === "deploying") {
+        return;
+      }
       await ctx.runMutation(internal.projects.update, {
         projectId: args.projectId,
         status: "error",
@@ -247,9 +279,19 @@ async function generateApp(input: {
   if (!app.files.some((file) => file.path === "index.html")) {
     throw new Error("Generated app is missing index.html.");
   }
-  app.icon = [...(app.icon ?? "🛠️")][0] ?? "🛠️";
-  app.appName = (app.appName || "New App").slice(0, 40);
+  app.icon = firstGrapheme(app.icon) ?? "🛠️";
+  app.appName = [...(app.appName || "New App")].slice(0, 40).join("");
   return app;
+}
+
+/** First user-perceived character — keeps ZWJ/flag/skin-tone emoji intact. */
+function firstGrapheme(value: string | undefined): string | undefined {
+  if (!value) return undefined;
+  const segmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+  for (const segment of segmenter.segment(value.trim())) {
+    return segment.segment || undefined;
+  }
+  return undefined;
 }
 
 function buildUserMessage(input: {
@@ -262,8 +304,14 @@ function buildUserMessage(input: {
     return `Build this web app:\n\n${input.request}`;
   }
 
-  const conversation = input.history
-    .filter((m) => m.role === "user" || m.role === "assistant")
+  // The new request was already appended to history — drop it from the
+  // conversation recap so the model doesn't see it twice.
+  const chat = input.history.filter((m) => m.role === "user" || m.role === "assistant");
+  if (chat.length > 0 && chat[chat.length - 1].role === "user" &&
+      chat[chat.length - 1].content === input.request) {
+    chat.pop();
+  }
+  const conversation = chat
     .slice(-12)
     .map((m) => `${m.role === "user" ? "User" : "You"}: ${m.content}`)
     .join("\n");
@@ -371,12 +419,27 @@ async function restartServer(sandbox: Sandbox): Promise<void> {
     undefined,
     30,
   );
-  const sessionId = `web-${Date.now()}`;
-  await sandbox.process.createSession(sessionId);
-  await sandbox.process.executeSessionCommand(sessionId, {
+  // Fixed session id so repeated deploys don't accumulate sessions.
+  try {
+    await sandbox.process.deleteSession("web");
+  } catch {
+    // No previous session (fresh sandbox or restarted) — fine.
+  }
+  await sandbox.process.createSession("web");
+  await sandbox.process.executeSessionCommand("web", {
     command: `cd '${SITE_DIR}' && python3 -m http.server ${PORT} --bind 0.0.0.0`,
     runAsync: true,
   });
+  // Don't report "ready" until the port actually answers.
+  const probe = await sandbox.process.executeCommand(
+    `for i in $(seq 1 40); do curl -sf -o /dev/null http://127.0.0.1:${PORT}/ && exit 0; sleep 0.25; done; exit 1`,
+    undefined,
+    undefined,
+    30,
+  );
+  if (probe.exitCode !== 0) {
+    throw new Error("The static server did not start inside the sandbox.");
+  }
 }
 
 async function ensureServerRunning(sandbox: Sandbox): Promise<void> {

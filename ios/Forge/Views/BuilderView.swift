@@ -65,16 +65,20 @@ final class BuilderViewModel: ObservableObject {
         }
     }
 
-    func send(prompt: String) async {
+    /// Returns false when the message could not be delivered (so the caller
+    /// can restore the draft).
+    func send(prompt: String) async -> Bool {
         let trimmed = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
+        guard !trimmed.isEmpty else { return true }
         isSending = true
         defer { isSending = false }
         do {
             try await APIClient.shared.sendMessage(projectId: projectId, prompt: trimmed)
             await refresh()
+            return true
         } catch {
             errorMessage = error.localizedDescription
+            return false
         }
     }
 
@@ -92,6 +96,7 @@ final class BuilderViewModel: ObservableObject {
 struct BuilderView: View {
     @StateObject private var viewModel: BuilderViewModel
     @State private var selectedTab: Tab = .chat
+    @State private var hasSetInitialTab = false
 
     enum Tab: String, CaseIterable {
         case preview = "Preview"
@@ -124,13 +129,24 @@ struct BuilderView: View {
                         .padding(.top, 10)
                 }
 
-                switch selectedTab {
-                case .preview:
+                if let error = viewModel.errorMessage {
+                    errorBanner(error)
+                        .padding(.horizontal, 16)
+                        .padding(.top, 8)
+                }
+
+                // Keep every tab alive so the WKWebView (and its page state)
+                // survives tab switches — only visibility changes.
+                ZStack {
                     PreviewTab(viewModel: viewModel)
-                case .chat:
+                        .opacity(selectedTab == .preview ? 1 : 0)
+                        .allowsHitTesting(selectedTab == .preview)
                     ChatTab(viewModel: viewModel)
-                case .code:
+                        .opacity(selectedTab == .chat ? 1 : 0)
+                        .allowsHitTesting(selectedTab == .chat)
                     CodeTab(viewModel: viewModel)
+                        .opacity(selectedTab == .code ? 1 : 0)
+                        .allowsHitTesting(selectedTab == .code)
                 }
             }
         }
@@ -140,9 +156,13 @@ struct BuilderView: View {
             await viewModel.refresh()
             await viewModel.loadFiles()
             viewModel.startPolling()
-            // Land on the preview when the app is already live.
-            if viewModel.project?.status == .ready {
-                selectedTab = .preview
+            // Land on the preview when the app is already live — but only on
+            // the first appearance, not when popping back from a file view.
+            if !hasSetInitialTab {
+                hasSetInitialTab = true
+                if viewModel.project?.status == .ready {
+                    selectedTab = .preview
+                }
             }
         }
         .onDisappear { viewModel.stopPolling() }
@@ -151,6 +171,27 @@ struct BuilderView: View {
                 selectedTab = .preview
             }
         }
+    }
+
+    private func errorBanner(_ message: String) -> some View {
+        HStack(spacing: 10) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(Theme.yellow)
+            Text(message)
+                .font(.footnote)
+                .foregroundStyle(Theme.textPrimary)
+                .lineLimit(3)
+            Spacer()
+            Button {
+                viewModel.errorMessage = nil
+            } label: {
+                Image(systemName: "xmark")
+                    .font(.system(size: 11, weight: .bold))
+                    .foregroundStyle(Theme.textSecondary)
+            }
+        }
+        .padding(12)
+        .card()
     }
 
     private var tabBar: some View {

@@ -103,7 +103,7 @@ First launch: tap **Enter App** → the gear icon (Settings) → paste your `htt
 | `POST` | `/api/projects/:id/wake` | Restart a slept sandbox |
 | `DELETE` | `/api/projects/:id` | Delete project + its sandbox |
 
-> ⚠️ Like the "one user, no auth" brief, these endpoints are unauthenticated. Anyone with your deployment URL can create builds — don't ship this to production without adding an auth layer.
+> ⚠️ Like the "one user, no auth" brief, these endpoints are open by default. To lock them down, set a shared secret on the deployment — `npx convex env set FORGE_API_SECRET 'some-long-random-string'` — and paste the same value into the app's Settings screen (it's sent as an `x-forge-secret` header on every request).
 
 ## Repo layout
 

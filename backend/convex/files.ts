@@ -36,6 +36,9 @@ export const replaceAll = internalMutation({
     files: v.array(v.object({ path: v.string(), content: v.string() })),
   },
   handler: async (ctx, args) => {
+    // Tolerate the project having been deleted mid-build — don't insert
+    // orphaned rows.
+    if (!(await ctx.db.get(args.projectId))) return;
     const existing = await ctx.db
       .query("files")
       .withIndex("by_project", (q) => q.eq("projectId", args.projectId))

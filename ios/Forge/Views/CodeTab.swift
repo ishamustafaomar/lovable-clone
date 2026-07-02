@@ -99,27 +99,31 @@ struct FileRow: View {
 struct CodeFileView: View {
     let file: ProjectFile
 
+    private var numberedContent: String {
+        let lines = file.content.components(separatedBy: "\n")
+        let width = String(lines.count).count
+        return lines.enumerated()
+            .map { index, line in
+                let number = String(index + 1)
+                let padding = String(repeating: " ", count: width - number.count)
+                return "\(padding)\(number)  \(line)"
+            }
+            .joined(separator: "\n")
+    }
+
     var body: some View {
         ZStack {
             Theme.background.ignoresSafeArea()
 
+            // One Text for the whole file — thousands of per-line views would
+            // freeze the main thread on large generated files.
             ScrollView([.vertical, .horizontal]) {
-                let lines = file.content.components(separatedBy: "\n")
-                VStack(alignment: .leading, spacing: 0) {
-                    ForEach(Array(lines.enumerated()), id: \.offset) { index, line in
-                        HStack(alignment: .top, spacing: 12) {
-                            Text("\(index + 1)")
-                                .font(.system(size: 12, design: .monospaced))
-                                .foregroundStyle(Theme.textSecondary.opacity(0.5))
-                                .frame(width: 36, alignment: .trailing)
-                            Text(line.isEmpty ? " " : line)
-                                .font(.system(size: 13, design: .monospaced))
-                                .foregroundStyle(Theme.textPrimary)
-                        }
-                        .padding(.vertical, 1)
-                    }
-                }
-                .padding(14)
+                Text(numberedContent)
+                    .font(.system(size: 13, design: .monospaced))
+                    .foregroundStyle(Theme.textPrimary)
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: true, vertical: true)
+                    .padding(14)
             }
         }
         .navigationTitle(file.path)

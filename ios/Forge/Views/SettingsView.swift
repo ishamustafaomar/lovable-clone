@@ -3,9 +3,11 @@ import SwiftUI
 struct SettingsView: View {
     @Environment(\.dismiss) private var dismiss
     @AppStorage(APIClient.backendURLKey) private var backendURL = ""
+    @AppStorage(APIClient.apiSecretKey) private var apiSecret = ""
     @AppStorage("signedIn") private var signedIn = false
 
     @State private var draftURL = ""
+    @State private var draftSecret = ""
     @State private var testState: TestState = .idle
 
     enum TestState: Equatable {
@@ -40,6 +42,29 @@ struct SettingsView: View {
                             .card()
 
                             Text("The HTTP Actions URL of your Convex deployment (ends in .convex.site). Find it with `npx convex dashboard` → Settings → URL & Deploy Key.")
+                                .font(.caption)
+                                .foregroundStyle(Theme.textSecondary)
+                        }
+
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("API secret (optional)")
+                                .font(.footnote.weight(.semibold))
+                                .foregroundStyle(Theme.textSecondary)
+
+                            SecureField(
+                                "",
+                                text: $draftSecret,
+                                prompt: Text("Only if FORGE_API_SECRET is set")
+                                    .foregroundStyle(Theme.textSecondary.opacity(0.6))
+                            )
+                            .textFieldStyle(.plain)
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+                            .foregroundStyle(Theme.textPrimary)
+                            .padding(14)
+                            .card()
+
+                            Text("Sent as the `x-forge-secret` header. Leave empty unless you set FORGE_API_SECRET on the Convex deployment.")
                                 .font(.caption)
                                 .foregroundStyle(Theme.textSecondary)
                         }
@@ -144,12 +169,16 @@ struct SettingsView: View {
                         .fontWeight(.semibold)
                 }
             }
-            .onAppear { draftURL = backendURL }
+            .onAppear {
+                draftURL = backendURL
+                draftSecret = apiSecret
+            }
         }
     }
 
     private func saveAndTest() {
         backendURL = draftURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        apiSecret = draftSecret.trimmingCharacters(in: .whitespacesAndNewlines)
         testState = .testing
         Task {
             do {

@@ -99,11 +99,45 @@ export const update = internalMutation({
   },
   handler: async (ctx, args) => {
     const { projectId, ...fields } = args;
+    // Tolerate the project having been deleted mid-build.
+    if (!(await ctx.db.get(projectId))) return;
     const patch: Record<string, unknown> = { updatedAt: Date.now() };
     for (const [key, value] of Object.entries(fields)) {
       if (value !== undefined) patch[key] = value;
     }
     await ctx.db.patch(projectId, patch);
+  },
+});
+
+/** How long a build may sit in generating/deploying before we assume the action died. */
+const BUILD_STALE_MS = 15 * 60 * 1000;
+
+/**
+ * Atomic check-and-set guard for starting a build: rejects when a (fresh)
+ * build is already running, otherwise flips the project to `generating` and
+ * records the user's prompt — all in one transaction, so two rapid requests
+ * can't both start builds.
+ */
+export const tryStartBuild = internalMutation({
+  args: { projectId: v.id("projects"), prompt: v.string() },
+  handler: async (ctx, args) => {
+    const project = await ctx.db.get(args.projectId);
+    if (!project) return "not_found";
+    const busy =
+      (project.status === "generating" || project.status === "deploying") &&
+      Date.now() - project.updatedAt < BUILD_STALE_MS;
+    if (busy) return "busy";
+    await ctx.db.patch(args.projectId, {
+      status: "generating",
+      statusMessage: "Queued for generation…",
+      updatedAt: Date.now(),
+    });
+    await ctx.db.insert("messages", {
+      projectId: args.projectId,
+      role: "user",
+      content: args.prompt,
+    });
+    return "started";
   },
 });
 

@@ -70,7 +70,13 @@ struct ChatTab: View {
                 let text = draft
                 draft = ""
                 inputFocused = false
-                Task { await viewModel.send(prompt: text) }
+                Task {
+                    let delivered = await viewModel.send(prompt: text)
+                    if !delivered {
+                        // Give the user their prompt back so they can retry.
+                        draft = text
+                    }
+                }
             } label: {
                 Image(systemName: "arrow.up")
                     .font(.system(size: 16, weight: .bold))

@@ -16,16 +16,30 @@ function json(data: unknown, status = 200): Response {
 
 const notFound = () => json({ error: "Project not found" }, 404);
 
+/**
+ * Optional shared-secret auth: if FORGE_API_SECRET is set on the deployment,
+ * every request must carry it in the `x-forge-secret` header. Left unset, the
+ * API stays open (single-user mode).
+ */
+function deny(request: Request): Response | null {
+  const secret = process.env.FORGE_API_SECRET;
+  if (!secret) return null;
+  if (request.headers.get("x-forge-secret") === secret) return null;
+  return json({ error: "Unauthorized: missing or wrong x-forge-secret header" }, 401);
+}
+
 http.route({
   path: "/api/health",
   method: "GET",
-  handler: httpAction(async () => json({ ok: true })),
+  handler: httpAction(async (_ctx, request) => deny(request) ?? json({ ok: true })),
 });
 
 http.route({
   path: "/api/projects",
   method: "GET",
-  handler: httpAction(async (ctx) => {
+  handler: httpAction(async (ctx, request) => {
+    const denied = deny(request);
+    if (denied) return denied;
     const projects = await ctx.runQuery(internal.projects.list, {});
     return json({ projects });
   }),
@@ -35,6 +49,8 @@ http.route({
   path: "/api/projects",
   method: "POST",
   handler: httpAction(async (ctx, request) => {
+    const denied = deny(request);
+    if (denied) return denied;
     const body = await request.json().catch(() => null);
     const prompt = typeof body?.prompt === "string" ? body.prompt.trim() : "";
     const name = typeof body?.name === "string" ? body.name.trim() : "";
@@ -58,6 +74,8 @@ http.route({
   pathPrefix: "/api/projects/",
   method: "GET",
   handler: httpAction(async (ctx, request) => {
+    const denied = deny(request);
+    if (denied) return denied;
     const segments = new URL(request.url).pathname.split("/").filter(Boolean);
     const rawId = segments[2];
     const sub = segments[3];
@@ -86,6 +104,8 @@ http.route({
   pathPrefix: "/api/projects/",
   method: "POST",
   handler: httpAction(async (ctx, request) => {
+    const denied = deny(request);
+    if (denied) return denied;
     const segments = new URL(request.url).pathname.split("/").filter(Boolean);
     const rawId = segments[2];
     const sub = segments[3];
@@ -101,16 +121,17 @@ http.route({
       const prompt = typeof body?.prompt === "string" ? body.prompt.trim() : "";
       if (!prompt) return json({ error: "Missing 'prompt' in request body" }, 400);
 
-      const project = await ctx.runQuery(internal.projects.get, { projectId });
-      if (project?.status === "generating" || project?.status === "deploying") {
+      // Atomic check-and-set — prevents two rapid requests from both
+      // passing a read-only status check and starting concurrent builds.
+      const started = await ctx.runMutation(internal.projects.tryStartBuild, {
+        projectId,
+        prompt,
+      });
+      if (started === "not_found") return notFound();
+      if (started === "busy") {
         return json({ error: "A build is already in progress" }, 409);
       }
 
-      await ctx.runMutation(internal.messages.add, {
-        projectId,
-        role: "user",
-        content: prompt,
-      });
       await ctx.scheduler.runAfter(0, internal.builder.build, {
         projectId,
         prompt,
@@ -133,6 +154,8 @@ http.route({
   pathPrefix: "/api/projects/",
   method: "DELETE",
   handler: httpAction(async (ctx, request) => {
+    const denied = deny(request);
+    if (denied) return denied;
     const segments = new URL(request.url).pathname.split("/").filter(Boolean);
     const rawId = segments[2];
     if (!rawId || segments[3]) return notFound();

@@ -11,7 +11,7 @@
 
     /* These compiler options are required by Convex */
     "target": "ESNext",
-    "lib": ["ES2021", "dom", "ES2023.Array"],
+    "lib": ["ES2021", "dom", "ES2023.Array", "ES2022.Intl"],
     "forceConsistentCasingInFileNames": true,
     "module": "ESNext",
     "moduleResolution": "Bundler",
