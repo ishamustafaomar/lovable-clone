@@ -4,15 +4,32 @@ import { internal } from "./_generated/api";
 
 const http = httpRouter();
 
+/**
+ * CORS: the web client runs on a different origin (Vercel/Netlify), so every
+ * response carries these headers and each route answers OPTIONS preflights —
+ * browsers send them for JSON bodies, DELETE, and the x-forge-secret header.
+ */
+const CORS_HEADERS = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type, x-forge-secret",
+  "Access-Control-Max-Age": "86400",
+};
+
 function json(data: unknown, status = 200): Response {
   return new Response(JSON.stringify(data), {
     status,
-    headers: {
-      "Content-Type": "application/json",
-      "Access-Control-Allow-Origin": "*",
-    },
+    headers: { "Content-Type": "application/json", ...CORS_HEADERS },
   });
 }
+
+const preflight = httpAction(
+  async () => new Response(null, { status: 204, headers: CORS_HEADERS }),
+);
+
+http.route({ path: "/api/health", method: "OPTIONS", handler: preflight });
+http.route({ path: "/api/projects", method: "OPTIONS", handler: preflight });
+http.route({ pathPrefix: "/api/projects/", method: "OPTIONS", handler: preflight });
 
 const notFound = () => json({ error: "Project not found" }, 404);
 

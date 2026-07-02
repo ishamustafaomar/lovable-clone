@@ -1,27 +1,28 @@
-# 🔨 Forge — a Replit-style mobile app builder
+# 🔨 Forge — a Replit-style app builder (web + iOS)
 
-Forge is a SwiftUI iPhone app that builds **live web apps from natural-language prompts**, in the spirit of the Replit mobile app: describe what you want, watch Claude write the code, and use the running app right inside the phone — with chat-driven iteration, a code browser, and a live preview.
+Forge builds **live web apps from natural-language prompts**, in the spirit of the Replit mobile app: describe what you want, watch Claude write the code, and use the running app right away — with chat-driven iteration, a code browser, and a live preview. Two clients share one backend: a React web app you can host on Vercel or Netlify, and a SwiftUI iPhone app.
 
 ```
-┌────────────────┐     HTTPS (JSON)      ┌─────────────────────────┐
-│  Forge (iOS)   │ ───────────────────▶  │  Convex backend          │
-│  SwiftUI app   │  ◀─────────────────── │  (DB + HTTP API +        │
-│                │    polling            │   background actions)    │
-│  • Chat        │                       │      │            │      │
-│  • Preview     │                       │      ▼            ▼      │
-│  • Code        │                       │  Claude API    Daytona    │
-└────────────────┘                       │  (codegen)     (sandbox) │
-        │                                └─────────────────────────┘
+┌────────────────────┐     HTTPS (JSON)      ┌─────────────────────────┐
+│  Forge clients     │ ───────────────────▶  │  Convex backend          │
+│  • Web (React on   │  ◀─────────────────── │  (DB + HTTP API +        │
+│    Vercel/Netlify) │    polling            │   background actions)    │
+│  • iOS (SwiftUI)   │                       │      │            │      │
+│                    │                       │      ▼            ▼      │
+│  Chat│Preview│Code │                       │  Claude API    Daytona    │
+└────────────────────┘                       │  (codegen)     (sandbox) │
+        │                                    └─────────────────────────┘
         │            live preview URL (https://3000-<sandbox>.proxy.daytona.work)
-        └───────────────────────────────────────────▶  WKWebView
+        └───────────────────────────▶  iframe (web) / WKWebView (iOS)
 ```
 
 **Stack**
 
 | Piece | Tech |
 |---|---|
+| Web app | Vite + React + TypeScript SPA (`web/`), deployable to Vercel/Netlify straight from GitHub |
 | iOS app | SwiftUI (iOS 17+), WKWebView preview, dark Replit-style UI |
-| Database + API | [Convex](https://convex.dev) — tables for projects/messages/files, HTTP actions as the mobile API, scheduler for background builds |
+| Database + API | [Convex](https://convex.dev) — tables for projects/messages/files, HTTP actions as the client API (CORS-enabled), scheduler for background builds |
 | Code generation | Claude (`claude-opus-4-8`) via `@anthropic-ai/sdk`, structured JSON output (multi-file static web apps) |
 | App hosting | [Daytona](https://daytona.io) sandboxes — each project gets an isolated cloud sandbox serving the generated app on a public preview URL |
 
@@ -66,7 +67,37 @@ curl https://<your-deployment>.convex.site/api/health
 # → {"ok":true}
 ```
 
-## 2. Run the iOS app in the Simulator
+## 2. Deploy the web app from GitHub (Vercel or Netlify)
+
+The web client is a static SPA in `web/` — it talks directly to your Convex deployment, so there is no server of its own.
+
+**Vercel**
+
+1. [vercel.com/new](https://vercel.com/new) → Import your GitHub repo.
+2. Set **Root Directory** to `web` (framework auto-detects as Vite).
+3. *(Optional)* Add env var `VITE_CONVEX_SITE_URL=https://your-deployment.convex.site` to pre-configure the backend URL for every visitor.
+4. Deploy. Every push to the connected branch redeploys automatically.
+
+**Netlify**
+
+1. [app.netlify.com/start](https://app.netlify.com/start) → Import your GitHub repo.
+2. Build settings are read from the repo-root `netlify.toml` (base `web`, publish `dist`) — no manual config needed.
+3. *(Optional)* Add the same `VITE_CONVEX_SITE_URL` env var.
+4. Deploy. Every push redeploys automatically.
+
+If you skip the env var, the app shows a **Connect your backend** screen — paste your `.convex.site` URL into Settings (stored in the browser's localStorage, along with the optional API secret).
+
+**Local development**
+
+```bash
+cd web
+npm install
+npm run dev      # http://localhost:5173
+```
+
+> The backend's HTTP routes answer CORS preflights (`OPTIONS`, plus the `x-forge-secret` header allowance), so any web origin can talk to it. Set `FORGE_API_SECRET` if you want to lock that down.
+
+## 3. Run the iOS app in the Simulator
 
 Requirements: macOS with **Xcode 16+** (the project uses the Xcode 16 folder-synchronized project format).
 
@@ -90,7 +121,7 @@ First launch: tap **Enter App** → the gear icon (Settings) → paste your `htt
 
 *(Prefer XcodeGen? `ios/project.yml` is included — `brew install xcodegen && cd ios && xcodegen generate`.)*
 
-## 3. HTTP API (what the app talks to)
+## 4. HTTP API (what the clients talk to)
 
 | Method | Path | Description |
 |---|---|---|
@@ -110,9 +141,16 @@ First launch: tap **Enter App** → the gear icon (Settings) → paste your `htt
 ```
 backend/               Convex backend
   convex/schema.ts       projects / messages / files tables
-  convex/http.ts         HTTP API for the iOS app
+  convex/http.ts         HTTP API for both clients (CORS-enabled)
   convex/builder.ts      "use node" action: Claude codegen + Daytona deploy
   convex/projects|messages|files.ts   internal queries/mutations
+web/                   Web client (Vite + React + TS)
+  src/pages/             HomePage (project list), BuilderPage (chat/preview/code)
+  src/components/        chat, preview iframe, code viewer, modals
+  src/api.ts             HTTP client (backend URL + secret in localStorage)
+  vercel.json            SPA rewrites for Vercel
+  netlify.toml           build config when the site's base dir is web/
+netlify.toml           repo-root Netlify config (base = web)
 ios/
   Forge.xcodeproj/       Xcode 16 project (hand-authored, synchronized folder)
   Forge/                 SwiftUI sources
