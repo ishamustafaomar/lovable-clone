@@ -1,0 +1,10 @@
+# Deploy the web client (web/) as the Netlify site.
+[build]
+  base = "web"
+  command = "npm run build"
+  publish = "dist"
+
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200

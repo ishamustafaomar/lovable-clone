@@ -1,0 +1,585 @@
+"use node";
+
+import { internalAction } from "./_generated/server";
+import { internal } from "./_generated/api";
+import { v } from "convex/values";
+import Anthropic from "@anthropic-ai/sdk";
+import { Daytona, type Sandbox } from "@daytona/sdk";
+
+const MODEL = "claude-opus-4-8";
+/** Gemini's free-tier model with a large output budget (needed for multi-file apps). */
+const GEMINI_MODEL = "gemini-2.5-flash";
+const SITE_DIR = "/home/daytona/site";
+const PORT = 3000;
+/** Minutes of inactivity before Daytona parks the sandbox (frees quota; woken via /wake). */
+const AUTO_STOP_MINUTES = 30;
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+interface GeneratedFile {
+  path: string;
+  content: string;
+}
+
+interface GeneratedApp {
+  appName: string;
+  icon: string;
+  summary: string;
+  files: GeneratedFile[];
+}
+
+interface GeminiResponse {
+  candidates?: {
+    finishReason?: string;
+    content?: { parts?: { text?: string }[] };
+  }[];
+  promptFeedback?: { blockReason?: string };
+}
+
+// ---------------------------------------------------------------------------
+// Actions
+// ---------------------------------------------------------------------------
+
+export const build = internalAction({
+  args: {
+    projectId: v.id("projects"),
+    prompt: v.string(),
+    isFirstBuild: v.boolean(),
+  },
+  handler: async (ctx, args) => {
+    const setStatus = async (
+      status: "generating" | "deploying" | "ready" | "error",
+      statusMessage: string,
+    ) => {
+      await ctx.runMutation(internal.projects.update, {
+        projectId: args.projectId,
+        status,
+        statusMessage,
+      });
+    };
+
+    try {
+      const project = await ctx.runQuery(internal.projects.get, {
+        projectId: args.projectId,
+      });
+      if (!project) return; // deleted while queued
+
+      await setStatus("generating", "Claude is writing your app…");
+
+      const existingFiles = await ctx.runQuery(internal.files.byProject, {
+        projectId: args.projectId,
+      });
+      const history = await ctx.runQuery(internal.messages.byProject, {
+        projectId: args.projectId,
+      });
+
+      const app = await generateApp({
+        request: args.prompt,
+        history,
+        existingFiles,
+        isFirstBuild: args.isFirstBuild,
+      });
+
+      // Generation takes minutes — the project may have been deleted meanwhile.
+      if (!(await ctx.runQuery(internal.projects.get, { projectId: args.projectId }))) {
+        return;
+      }
+
+      await ctx.runMutation(internal.files.replaceAll, {
+        projectId: args.projectId,
+        files: app.files,
+      });
+      if (args.isFirstBuild) {
+        await ctx.runMutation(internal.projects.update, {
+          projectId: args.projectId,
+          name: project.name === "New App" ? app.appName : project.name,
+          icon: app.icon,
+        });
+      }
+
+      await setStatus("deploying", "Uploading to your cloud sandbox…");
+
+      const deployed = await deployToSandbox(project.sandboxId, app.files);
+
+      // If the project was deleted while we deployed, don't leak the sandbox.
+      if (!(await ctx.runQuery(internal.projects.get, { projectId: args.projectId }))) {
+        await ctx.scheduler.runAfter(0, internal.builder.destroySandbox, {
+          sandboxId: deployed.sandboxId,
+        });
+        return;
+      }
+
+      await ctx.runMutation(internal.projects.update, {
+        projectId: args.projectId,
+        status: "ready",
+        statusMessage: "Live",
+        sandboxId: deployed.sandboxId,
+        previewUrl: deployed.previewUrl,
+      });
+      await ctx.runMutation(internal.messages.add, {
+        projectId: args.projectId,
+        role: "assistant",
+        content: app.summary,
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      try {
+        await setStatus("error", message);
+        await ctx.runMutation(internal.messages.add, {
+          projectId: args.projectId,
+          role: "error",
+          content: `Build failed: ${message}`,
+        });
+      } catch {
+        // Project vanished while reporting the failure — nothing left to do.
+      }
+    }
+  },
+});
+
+/** Restart a parked sandbox and make sure the static server is running. */
+export const wake = internalAction({
+  args: { projectId: v.id("projects") },
+  handler: async (ctx, args) => {
+    const project = await ctx.runQuery(internal.projects.get, {
+      projectId: args.projectId,
+    });
+    if (!project?.sandboxId) return;
+    // Never fight an in-flight build over the status field.
+    if (project.status === "generating" || project.status === "deploying") return;
+
+    try {
+      const daytona = new Daytona();
+      const sandbox = await daytona.get(project.sandboxId);
+      await sandbox.refreshData();
+      if (sandbox.state !== "started") {
+        await sandbox.start(120);
+      }
+      await ensureServerRunning(sandbox);
+      const preview = await sandbox.getPreviewLink(PORT);
+      // A build may have started while the sandbox was booting — don't clobber it.
+      const current = await ctx.runQuery(internal.projects.get, {
+        projectId: args.projectId,
+      });
+      if (!current || current.status === "generating" || current.status === "deploying") {
+        return;
+      }
+      await ctx.runMutation(internal.projects.update, {
+        projectId: args.projectId,
+        status: "ready",
+        statusMessage: "Live",
+        previewUrl: preview.url,
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const current = await ctx.runQuery(internal.projects.get, {
+        projectId: args.projectId,
+      });
+      if (!current || current.status === "generating" || current.status === "deploying") {
+        return;
+      }
+      await ctx.runMutation(internal.projects.update, {
+        projectId: args.projectId,
+        status: "error",
+        statusMessage: `Could not wake sandbox: ${message}`,
+      });
+    }
+  },
+});
+
+export const destroySandbox = internalAction({
+  args: { sandboxId: v.string() },
+  handler: async (_ctx, args) => {
+    try {
+      const daytona = new Daytona();
+      const sandbox = await daytona.get(args.sandboxId);
+      await sandbox.delete(60);
+    } catch {
+      // Sandbox already gone — nothing to clean up.
+    }
+  },
+});
+
+// ---------------------------------------------------------------------------
+// Code generation (Claude)
+// ---------------------------------------------------------------------------
+
+const SYSTEM_PROMPT = `You are Forge, an expert web developer who builds complete, polished web apps from natural-language descriptions.
+
+Rules:
+- Build a fully self-contained STATIC web app: an index.html entry point plus optional styles.css, app.js, and other files. Reference files with relative paths.
+- No build step, no npm, no server-side code — files are served as-is by a static file server.
+- Well-known libraries from public CDNs are allowed (Tailwind via https://cdn.tailwindcss.com, Chart.js, Alpine.js, Google Fonts, etc.).
+- The app is viewed primarily inside an iPhone WebView: design mobile-first and responsive, include <meta name="viewport" content="width=device-width, initial-scale=1">, use comfortable touch targets, and avoid hover-only interactions.
+- Persist user data with localStorage where it makes sense.
+- Free, keyless public APIs are allowed (e.g. Open-Meteo). Never require API keys, accounts, or signups.
+- Visual polish matters: thoughtful typography, spacing, color palette, empty states, and tasteful animations. Avoid generic AI-slop aesthetics.
+- ALWAYS return the COMPLETE file set for the app — every file with full contents, including files that did not change. Whatever you return fully replaces the previous files.
+- Keep the app focused; total output should stay under roughly 2500 lines.
+
+Return JSON with:
+- appName: a short catchy name (1-3 words)
+- icon: exactly one emoji that fits the app
+- summary: 2-3 friendly sentences to the user describing what you built or changed
+- files: the complete array of {path, content}`;
+
+const APP_SCHEMA = {
+  type: "object",
+  properties: {
+    appName: { type: "string" },
+    icon: { type: "string" },
+    summary: { type: "string" },
+    files: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          path: { type: "string" },
+          content: { type: "string" },
+        },
+        required: ["path", "content"],
+        additionalProperties: false,
+      },
+    },
+  },
+  required: ["appName", "icon", "summary", "files"],
+  additionalProperties: false,
+} as const;
+
+/**
+ * Same shape as APP_SCHEMA but in Gemini's response-schema dialect: uppercase
+ * types, `propertyOrdering`, and no `additionalProperties` (unsupported).
+ */
+const GEMINI_APP_SCHEMA = {
+  type: "OBJECT",
+  properties: {
+    appName: { type: "STRING" },
+    icon: { type: "STRING" },
+    summary: { type: "STRING" },
+    files: {
+      type: "ARRAY",
+      items: {
+        type: "OBJECT",
+        properties: {
+          path: { type: "STRING" },
+          content: { type: "STRING" },
+        },
+        required: ["path", "content"],
+        propertyOrdering: ["path", "content"],
+      },
+    },
+  },
+  required: ["appName", "icon", "summary", "files"],
+  propertyOrdering: ["appName", "icon", "summary", "files"],
+} as const;
+
+type LlmProvider = "anthropic" | "gemini";
+
+/**
+ * Pick the code-generation provider from whichever key is configured.
+ * Claude wins when both are set (higher-quality default); Gemini's free
+ * tier is the zero-cost fallback.
+ */
+function selectProvider(): { provider: LlmProvider; apiKey: string } {
+  const anthropicKey = process.env.ANTHROPIC_API_KEY;
+  if (anthropicKey) return { provider: "anthropic", apiKey: anthropicKey };
+  const geminiKey = process.env.GEMINI_API_KEY ?? process.env.GOOGLE_API_KEY;
+  if (geminiKey) return { provider: "gemini", apiKey: geminiKey };
+  throw new Error(
+    "No LLM API key set. Set ANTHROPIC_API_KEY (paid) or GEMINI_API_KEY (free tier) on the Convex deployment.",
+  );
+}
+
+async function generateApp(input: {
+  request: string;
+  history: { role: string; content: string }[];
+  existingFiles: GeneratedFile[];
+  isFirstBuild: boolean;
+}): Promise<GeneratedApp> {
+  const { provider, apiKey } = selectProvider();
+  const userMessage = buildUserMessage(input);
+  const rawJson =
+    provider === "anthropic"
+      ? await generateWithClaude(apiKey, userMessage)
+      : await generateWithGemini(apiKey, userMessage);
+
+  let app: GeneratedApp;
+  try {
+    app = JSON.parse(rawJson) as GeneratedApp;
+  } catch {
+    throw new Error("The model returned malformed JSON — try again.");
+  }
+  app.files = sanitizeFiles(app.files);
+  if (!app.files.some((file) => file.path === "index.html")) {
+    throw new Error("Generated app is missing index.html.");
+  }
+  app.icon = firstGrapheme(app.icon) ?? "🛠️";
+  app.appName = [...(app.appName || "New App")].slice(0, 40).join("");
+  return app;
+}
+
+/** Claude via the Anthropic SDK — structured JSON output, adaptive thinking. */
+async function generateWithClaude(
+  apiKey: string,
+  userMessage: string,
+): Promise<string> {
+  const anthropic = new Anthropic({ apiKey });
+  const stream = anthropic.messages.stream({
+    model: MODEL,
+    max_tokens: 64000,
+    thinking: { type: "adaptive" },
+    output_config: {
+      format: { type: "json_schema", schema: APP_SCHEMA },
+    },
+    system: SYSTEM_PROMPT,
+    messages: [{ role: "user", content: userMessage }],
+  });
+  const message = await stream.finalMessage();
+
+  if (message.stop_reason === "refusal") {
+    throw new Error("Claude declined to build this app — try rephrasing your request.");
+  }
+  if (message.stop_reason === "max_tokens") {
+    throw new Error("The app got too large to generate in one pass — try a simpler request.");
+  }
+
+  const text = message.content.find((block) => block.type === "text");
+  if (!text || text.type !== "text") {
+    throw new Error("Claude returned no content.");
+  }
+  return text.text;
+}
+
+/**
+ * Gemini via the REST API (no extra SDK dependency). Uses gemini-2.5-flash —
+ * free-tier eligible, with a large output budget and native structured JSON.
+ */
+async function generateWithGemini(
+  apiKey: string,
+  userMessage: string,
+): Promise<string> {
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-goog-api-key": apiKey },
+      body: JSON.stringify({
+        systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
+        contents: [{ role: "user", parts: [{ text: userMessage }] }],
+        generationConfig: {
+          responseMimeType: "application/json",
+          responseSchema: GEMINI_APP_SCHEMA,
+          maxOutputTokens: 64000,
+          temperature: 1,
+        },
+      }),
+    });
+  } catch {
+    throw new Error("Could not reach the Gemini API.");
+  }
+
+  if (!response.ok) {
+    const detail = await response.text().catch(() => "");
+    if (response.status === 429) {
+      throw new Error("Gemini free-tier rate limit hit — wait a minute and try again.");
+    }
+    throw new Error(`Gemini API error ${response.status}: ${detail.slice(0, 200)}`);
+  }
+
+  const data = (await response.json()) as GeminiResponse;
+  if (data.promptFeedback?.blockReason) {
+    throw new Error(
+      `Gemini declined this request (${data.promptFeedback.blockReason}) — try rephrasing.`,
+    );
+  }
+  const candidate = data.candidates?.[0];
+  if (candidate?.finishReason === "MAX_TOKENS") {
+    throw new Error("The app got too large to generate in one pass — try a simpler request.");
+  }
+  if (candidate?.finishReason && candidate.finishReason !== "STOP") {
+    throw new Error(
+      `Gemini could not complete the app (${candidate.finishReason}) — try rephrasing.`,
+    );
+  }
+
+  const text = (candidate?.content?.parts ?? [])
+    .map((part) => part.text ?? "")
+    .join("");
+  if (!text.trim()) {
+    throw new Error("Gemini returned no content.");
+  }
+  return text;
+}
+
+/** First user-perceived character — keeps ZWJ/flag/skin-tone emoji intact. */
+function firstGrapheme(value: string | undefined): string | undefined {
+  if (!value) return undefined;
+  const segmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+  for (const segment of segmenter.segment(value.trim())) {
+    return segment.segment || undefined;
+  }
+  return undefined;
+}
+
+function buildUserMessage(input: {
+  request: string;
+  history: { role: string; content: string }[];
+  existingFiles: GeneratedFile[];
+  isFirstBuild: boolean;
+}): string {
+  if (input.isFirstBuild || input.existingFiles.length === 0) {
+    return `Build this web app:\n\n${input.request}`;
+  }
+
+  // The new request was already appended to history — drop it from the
+  // conversation recap so the model doesn't see it twice.
+  const chat = input.history.filter((m) => m.role === "user" || m.role === "assistant");
+  if (chat.length > 0 && chat[chat.length - 1].role === "user" &&
+      chat[chat.length - 1].content === input.request) {
+    chat.pop();
+  }
+  const conversation = chat
+    .slice(-12)
+    .map((m) => `${m.role === "user" ? "User" : "You"}: ${m.content}`)
+    .join("\n");
+
+  const filesBlock = input.existingFiles
+    .map((file) => `===== ${file.path} =====\n${file.content}`)
+    .join("\n\n");
+
+  return [
+    "You previously built this app. Here is the conversation so far:",
+    conversation,
+    "Current files:",
+    filesBlock,
+    "Apply this change request and return the COMPLETE updated file set:",
+    input.request,
+  ].join("\n\n");
+}
+
+function sanitizeFiles(files: GeneratedFile[]): GeneratedFile[] {
+  const clean: GeneratedFile[] = [];
+  const seen = new Set<string>();
+  for (const file of files ?? []) {
+    if (!file?.path || typeof file.content !== "string") continue;
+    const path = file.path.replace(/^\/+/, "").trim();
+    if (!path || path.includes("..") || path.length > 200) continue;
+    // Paths end up in shell commands — allow only a conservative charset.
+    if (!/^[A-Za-z0-9._/-]+$/.test(path)) continue;
+    if (seen.has(path)) continue;
+    seen.add(path);
+    clean.push({ path, content: file.content });
+  }
+  if (clean.length === 0) {
+    throw new Error("Model returned no usable files.");
+  }
+  return clean;
+}
+
+// ---------------------------------------------------------------------------
+// Deployment (Daytona)
+// ---------------------------------------------------------------------------
+
+async function deployToSandbox(
+  existingSandboxId: string | undefined,
+  files: GeneratedFile[],
+): Promise<{ sandboxId: string; previewUrl: string }> {
+  if (!process.env.DAYTONA_API_KEY) {
+    throw new Error("DAYTONA_API_KEY is not set on the Convex deployment");
+  }
+  const daytona = new Daytona();
+
+  let sandbox: Sandbox | undefined;
+  if (existingSandboxId) {
+    try {
+      sandbox = await daytona.get(existingSandboxId);
+      await sandbox.refreshData();
+      if (sandbox.state !== "started") {
+        await sandbox.start(120);
+      }
+    } catch {
+      sandbox = undefined; // stale id — create a fresh sandbox below
+    }
+  }
+  if (!sandbox) {
+    sandbox = await daytona.create(
+      {
+        public: true,
+        autoStopInterval: AUTO_STOP_MINUTES,
+        labels: { app: "forge" },
+      },
+      { timeout: 180 },
+    );
+  }
+
+  // Wipe the old site and recreate the directory tree in one shell call.
+  const dirs = new Set<string>([SITE_DIR]);
+  for (const file of files) {
+    const slash = file.path.lastIndexOf("/");
+    if (slash > 0) dirs.add(`${SITE_DIR}/${file.path.slice(0, slash)}`);
+  }
+  const mkdirs = [...dirs].map((d) => `'${d}'`).join(" ");
+  await sandbox.process.executeCommand(
+    `rm -rf '${SITE_DIR}' && mkdir -p ${mkdirs}`,
+    undefined,
+    undefined,
+    60,
+  );
+
+  await sandbox.fs.uploadFiles(
+    files.map((file) => ({
+      source: Buffer.from(file.content, "utf8"),
+      destination: `${SITE_DIR}/${file.path}`,
+    })),
+  );
+
+  await restartServer(sandbox);
+
+  const preview = await sandbox.getPreviewLink(PORT);
+  return { sandboxId: sandbox.id, previewUrl: preview.url };
+}
+
+async function restartServer(sandbox: Sandbox): Promise<void> {
+  await sandbox.process.executeCommand(
+    "pkill -f 'http.server' || true",
+    undefined,
+    undefined,
+    30,
+  );
+  // Fixed session id so repeated deploys don't accumulate sessions.
+  try {
+    await sandbox.process.deleteSession("web");
+  } catch {
+    // No previous session (fresh sandbox or restarted) — fine.
+  }
+  await sandbox.process.createSession("web");
+  await sandbox.process.executeSessionCommand("web", {
+    command: `cd '${SITE_DIR}' && python3 -m http.server ${PORT} --bind 0.0.0.0`,
+    runAsync: true,
+  });
+  // Don't report "ready" until the port actually answers.
+  const probe = await sandbox.process.executeCommand(
+    `for i in $(seq 1 40); do curl -sf -o /dev/null http://127.0.0.1:${PORT}/ && exit 0; sleep 0.25; done; exit 1`,
+    undefined,
+    undefined,
+    30,
+  );
+  if (probe.exitCode !== 0) {
+    throw new Error("The static server did not start inside the sandbox.");
+  }
+}
+
+async function ensureServerRunning(sandbox: Sandbox): Promise<void> {
+  const check = await sandbox.process.executeCommand(
+    "pgrep -f 'http.server' >/dev/null && echo running || echo stopped",
+    undefined,
+    undefined,
+    30,
+  );
+  if (!check.result?.includes("running")) {
+    await restartServer(sandbox);
+  }
+}
