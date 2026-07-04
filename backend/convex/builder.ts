@@ -7,6 +7,8 @@ import Anthropic from "@anthropic-ai/sdk";
 import { Daytona, type Sandbox } from "@daytona/sdk";
 
 const MODEL = "claude-opus-4-8";
+/** Gemini's free-tier model with a large output budget (needed for multi-file apps). */
+const GEMINI_MODEL = "gemini-2.5-flash";
 const SITE_DIR = "/home/daytona/site";
 const PORT = 3000;
 /** Minutes of inactivity before Daytona parks the sandbox (frees quota; woken via /wake). */
@@ -26,6 +28,14 @@ interface GeneratedApp {
   icon: string;
   summary: string;
   files: GeneratedFile[];
+}
+
+interface GeminiResponse {
+  candidates?: {
+    finishReason?: string;
+    content?: { parts?: { text?: string }[] };
+  }[];
+  promptFeedback?: { blockReason?: string };
 }
 
 // ---------------------------------------------------------------------------
@@ -238,18 +248,84 @@ const APP_SCHEMA = {
   additionalProperties: false,
 } as const;
 
+/**
+ * Same shape as APP_SCHEMA but in Gemini's response-schema dialect: uppercase
+ * types, `propertyOrdering`, and no `additionalProperties` (unsupported).
+ */
+const GEMINI_APP_SCHEMA = {
+  type: "OBJECT",
+  properties: {
+    appName: { type: "STRING" },
+    icon: { type: "STRING" },
+    summary: { type: "STRING" },
+    files: {
+      type: "ARRAY",
+      items: {
+        type: "OBJECT",
+        properties: {
+          path: { type: "STRING" },
+          content: { type: "STRING" },
+        },
+        required: ["path", "content"],
+        propertyOrdering: ["path", "content"],
+      },
+    },
+  },
+  required: ["appName", "icon", "summary", "files"],
+  propertyOrdering: ["appName", "icon", "summary", "files"],
+} as const;
+
+type LlmProvider = "anthropic" | "gemini";
+
+/**
+ * Pick the code-generation provider from whichever key is configured.
+ * Claude wins when both are set (higher-quality default); Gemini's free
+ * tier is the zero-cost fallback.
+ */
+function selectProvider(): { provider: LlmProvider; apiKey: string } {
+  const anthropicKey = process.env.ANTHROPIC_API_KEY;
+  if (anthropicKey) return { provider: "anthropic", apiKey: anthropicKey };
+  const geminiKey = process.env.GEMINI_API_KEY ?? process.env.GOOGLE_API_KEY;
+  if (geminiKey) return { provider: "gemini", apiKey: geminiKey };
+  throw new Error(
+    "No LLM API key set. Set ANTHROPIC_API_KEY (paid) or GEMINI_API_KEY (free tier) on the Convex deployment.",
+  );
+}
+
 async function generateApp(input: {
   request: string;
   history: { role: string; content: string }[];
   existingFiles: GeneratedFile[];
   isFirstBuild: boolean;
 }): Promise<GeneratedApp> {
-  const apiKey = process.env.ANTHROPIC_API_KEY;
-  if (!apiKey) {
-    throw new Error("ANTHROPIC_API_KEY is not set on the Convex deployment");
-  }
-  const anthropic = new Anthropic({ apiKey });
+  const { provider, apiKey } = selectProvider();
+  const userMessage = buildUserMessage(input);
+  const rawJson =
+    provider === "anthropic"
+      ? await generateWithClaude(apiKey, userMessage)
+      : await generateWithGemini(apiKey, userMessage);
 
+  let app: GeneratedApp;
+  try {
+    app = JSON.parse(rawJson) as GeneratedApp;
+  } catch {
+    throw new Error("The model returned malformed JSON — try again.");
+  }
+  app.files = sanitizeFiles(app.files);
+  if (!app.files.some((file) => file.path === "index.html")) {
+    throw new Error("Generated app is missing index.html.");
+  }
+  app.icon = firstGrapheme(app.icon) ?? "🛠️";
+  app.appName = [...(app.appName || "New App")].slice(0, 40).join("");
+  return app;
+}
+
+/** Claude via the Anthropic SDK — structured JSON output, adaptive thinking. */
+async function generateWithClaude(
+  apiKey: string,
+  userMessage: string,
+): Promise<string> {
+  const anthropic = new Anthropic({ apiKey });
   const stream = anthropic.messages.stream({
     model: MODEL,
     max_tokens: 64000,
@@ -258,7 +334,7 @@ async function generateApp(input: {
       format: { type: "json_schema", schema: APP_SCHEMA },
     },
     system: SYSTEM_PROMPT,
-    messages: [{ role: "user", content: buildUserMessage(input) }],
+    messages: [{ role: "user", content: userMessage }],
   });
   const message = await stream.finalMessage();
 
@@ -271,17 +347,71 @@ async function generateApp(input: {
 
   const text = message.content.find((block) => block.type === "text");
   if (!text || text.type !== "text") {
-    throw new Error("Model returned no content.");
+    throw new Error("Claude returned no content.");
+  }
+  return text.text;
+}
+
+/**
+ * Gemini via the REST API (no extra SDK dependency). Uses gemini-2.5-flash —
+ * free-tier eligible, with a large output budget and native structured JSON.
+ */
+async function generateWithGemini(
+  apiKey: string,
+  userMessage: string,
+): Promise<string> {
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-goog-api-key": apiKey },
+      body: JSON.stringify({
+        systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
+        contents: [{ role: "user", parts: [{ text: userMessage }] }],
+        generationConfig: {
+          responseMimeType: "application/json",
+          responseSchema: GEMINI_APP_SCHEMA,
+          maxOutputTokens: 64000,
+          temperature: 1,
+        },
+      }),
+    });
+  } catch {
+    throw new Error("Could not reach the Gemini API.");
   }
 
-  const app = JSON.parse(text.text) as GeneratedApp;
-  app.files = sanitizeFiles(app.files);
-  if (!app.files.some((file) => file.path === "index.html")) {
-    throw new Error("Generated app is missing index.html.");
+  if (!response.ok) {
+    const detail = await response.text().catch(() => "");
+    if (response.status === 429) {
+      throw new Error("Gemini free-tier rate limit hit — wait a minute and try again.");
+    }
+    throw new Error(`Gemini API error ${response.status}: ${detail.slice(0, 200)}`);
   }
-  app.icon = firstGrapheme(app.icon) ?? "🛠️";
-  app.appName = [...(app.appName || "New App")].slice(0, 40).join("");
-  return app;
+
+  const data = (await response.json()) as GeminiResponse;
+  if (data.promptFeedback?.blockReason) {
+    throw new Error(
+      `Gemini declined this request (${data.promptFeedback.blockReason}) — try rephrasing.`,
+    );
+  }
+  const candidate = data.candidates?.[0];
+  if (candidate?.finishReason === "MAX_TOKENS") {
+    throw new Error("The app got too large to generate in one pass — try a simpler request.");
+  }
+  if (candidate?.finishReason && candidate.finishReason !== "STOP") {
+    throw new Error(
+      `Gemini could not complete the app (${candidate.finishReason}) — try rephrasing.`,
+    );
+  }
+
+  const text = (candidate?.content?.parts ?? [])
+    .map((part) => part.text ?? "")
+    .join("");
+  if (!text.trim()) {
+    throw new Error("Gemini returned no content.");
+  }
+  return text;
 }
 
 /** First user-perceived character — keeps ZWJ/flag/skin-tone emoji intact. */

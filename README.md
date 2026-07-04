@@ -23,7 +23,7 @@ Forge builds **live web apps from natural-language prompts**, in the spirit of t
 | Web app | Vite + React + TypeScript SPA (`web/`), deployable to Vercel/Netlify straight from GitHub |
 | iOS app | SwiftUI (iOS 17+), WKWebView preview, dark Replit-style UI |
 | Database + API | [Convex](https://convex.dev) — tables for projects/messages/files, HTTP actions as the client API (CORS-enabled), scheduler for background builds |
-| Code generation | Claude (`claude-opus-4-8`) via `@anthropic-ai/sdk`, structured JSON output (multi-file static web apps) |
+| Code generation | Claude (`claude-opus-4-8`) **or** Google Gemini (`gemini-2.5-flash`, free tier) — structured JSON output, multi-file static web apps; backend uses whichever key is configured |
 | App hosting | [Daytona](https://daytona.io) sandboxes — each project gets an isolated cloud sandbox serving the generated app on a public preview URL |
 
 **How a build works**
@@ -41,7 +41,12 @@ Sandboxes auto-stop after 30 minutes of inactivity (to save quota); the app's **
 
 ## 1. Deploy the backend (5 minutes)
 
-Requirements: Node 18+, a free [Convex](https://dashboard.convex.dev) account, an [Anthropic API key](https://console.anthropic.com), and a [Daytona API key](https://app.daytona.io) (free tier includes $200 credits).
+Requirements: Node 18+, a free [Convex](https://dashboard.convex.dev) account, a [Daytona API key](https://app.daytona.io) (free tier includes $200 credits), and **one** code-generation key:
+
+- **Free:** a [Google Gemini API key](https://aistudio.google.com/apikey) — no credit card, `gemini-2.5-flash` on the free tier (rate-limited).
+- **Best quality:** an [Anthropic API key](https://console.anthropic.com) — prepaid (~$5 minimum; each build is a few cents), runs Claude Opus.
+
+The backend uses whichever key is set, **preferring Anthropic** when both are present — so you can start free on Gemini and add Claude later with no code change.
 
 ```bash
 cd backend
@@ -50,8 +55,11 @@ npm install
 # Create/attach a Convex dev deployment (opens browser on first run)
 npx convex dev --once
 
-# Set the API keys on the deployment
-npx convex env set ANTHROPIC_API_KEY 'sk-ant-...'
+# Code generation — set EITHER of these (Anthropic wins if both are set):
+npx convex env set GEMINI_API_KEY 'AIza...'        # free tier
+# npx convex env set ANTHROPIC_API_KEY 'sk-ant-...' # paid, higher quality
+
+# App hosting (required)
 npx convex env set DAYTONA_API_KEY 'dtn_...'
 
 # Keep functions synced while developing (or `npx convex deploy` for prod)
@@ -161,6 +169,7 @@ ios/
 ## Troubleshooting
 
 - **"Backend not configured" / red banner** — Settings → paste the `.convex.site` URL (not `.convex.cloud`), Save & Test.
-- **Build fails with "ANTHROPIC_API_KEY is not set"** — run the `npx convex env set …` commands against the same deployment the app points at (add `--prod` if you deployed with `npx convex deploy`).
+- **Build fails with "No LLM API key set"** — set `GEMINI_API_KEY` (free) or `ANTHROPIC_API_KEY` on the same deployment the app points at (add `--prod` if you deployed with `npx convex deploy`).
+- **"Gemini free-tier rate limit hit"** — the free tier caps requests per minute/day; wait a moment and retry, or switch to an Anthropic key.
 - **Preview never loads** — the sandbox may have auto-stopped; open the Preview tab and tap **Wake Sandbox**. Check the Daytona dashboard for quota (free tier: 10 vCPU running at once).
 - **Xcode says "future project format"** — you're on Xcode 15 or older; upgrade to Xcode 16+, or regenerate the project with XcodeGen (`ios/project.yml`).
